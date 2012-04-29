@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Copyright: Larne Pekowsky <larnep@gmail.com>
 # License: GNU GPL, version 3 or later; http://www.gnu.org/copyleft/gpl.html
@@ -102,11 +102,6 @@ def parse_command_line():
             if name == 'kakasi_kanwadict' and not options.kakasi_kanwadict:
                 options.kakasi_kanwadict = value
 
-    for name, value in [('mecab', options.mecab), ('mecab_config', options.mecab_config), ('kakasi',options.kakasi)]:
-        if value is None:
-            abort("Please provide location to %s" % name)
-        elif not isfile(value):
-            abort("File given for %s (%s) does not exist" % (name, value))
 
     return options, texts
 
@@ -181,7 +176,7 @@ class MecabController(object):
                 print >>sys.stderr, "I couldn't find the mecab config file <%s>" % self.config.mecabrc
                 return
         else: # If the user gave a full path to mecab, we need the rc as well
-            if self.mecab_cmd != 'mecab':
+            if self.mecabCmd[0] != 'mecab':
                 print >>sys.stderr, "Please add the location of the mecabrc file to your config file"
                 return
 
@@ -453,6 +448,7 @@ class GoogleReader(Reader):
         Reader.__init__(self, config)
 
     def read(self, text):
+        text = text.encode('utf-8')
         self.setbasename()
 
         address = self.TTS_ADDRESS+'?tl=ja&q='+ quote_plus(str(text))
@@ -460,6 +456,7 @@ class GoogleReader(Reader):
         subprocess.Popen(['mplayer', '-slave', '-user-agent', "'Mozilla/5.0'", address, 
                '-dumpstream', '-dumpfile', self.outfile('mp3')], 
               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).wait()
+        return self.basename + '.mp3'
 
 
 def ReaderFactory(config):
