@@ -1,0 +1,614 @@
+#!/usr/bin/env python2.7
+# -*- coding: utf-8 -*-
+# Copyright: Larne Pekowsky <larnep@gmail.com>
+# License: GNU GPL, version 3 or later; http://www.gnu.org/copyleft/gpl.html
+#
+# Turns one or more batches of Japanese text into MCDs, ready for inporting
+# into Anki
+# 
+#
+# Includes code by:
+#   Damien Elmes <anki@ichi2.net>
+#     http://ichi2.net/anki/wiki/JapaneseSupport
+#   "Tokyostyle"
+#     http://code.google.com/p/mcdsupport/
+#   Arthur Helfstein Fragoso    
+#     http://code.google.com/p/googletts-anki/
+#
+
+import sys, os, platform, re, subprocess
+import urllib,httplib
+import codecs
+import time
+
+from urllib import quote_plus
+from optparse import OptionParser
+
+
+def isfile(f):
+    return os.path.exists(f) and os.path.isfile(f)
+
+def abort(message):
+    print >>sys.stderr, message
+    sys.exit(1)
+
+def programWorks(args):
+    try:
+        subproc = subprocess.Popen(
+            args, bufsize=-1, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            startupinfo=si)
+        return True
+    except:
+        return False
+
+def parse_command_line():
+    parser = OptionParser(
+                version = "Name: %prog%\n",
+                usage   = "%prog: <args>\n",
+                description = "Turns text into a file of MCDs, ready for input into anki\n")
+
+    parser.add_option('-c', '--config', metavar='config-file',  help='File with additional config options')
+    parser.add_option('-r', '--reader', metavar='reader',       help='Text-to-speech reader (Kyoko or Google)')
+    parser.add_option('-d', '--sound-dir', metavar='sound_dir', help='Media directory for deck')
+    parser.add_option('-k', '--keyword-file', metavar='keywords', help='File containing keywords')
+    parser.add_option('-i', '--input-file', metavar='infile', help='File containing text to process')
+    parser.add_option('-o', '--output-file', metavar='outfile', help='File to write')
+    
+    parser.add_option('-m', '--mecab',        metavar='mecab', help='Full path to mecab')
+    parser.add_option('-n', '--mecab-config', metavar='mecab_config', help='Full path to mecab\'s config file')
+    parser.add_option('-K', '--kakasi',        metavar='kakasi', help='Full path to kakasi')
+    parser.add_option('-L', '--kakasi_itaijidict',  metavar='kakasi_itaijidict', help='Full path to kakasi itaijidict')
+    parser.add_option('-M', '--kakasi_kanwadict',   metavar='kakasi_kanwadict',  help='Full path to kakasi kanwadict')
+
+    options, texts = parser.parse_args()
+
+    if options.config:
+        if not isfile(options.config): 
+            abort("Unable to read config file %s" % options.config)
+
+        for line in open(options.config):
+            line = line.strip()
+            if len(line) < 1 or line[0] == '#':
+                continue
+
+            try:
+                name, value = line.split('=')
+                name  = name.strip()
+                value = value.strip()
+            except:
+                print >>sys.stderr, "I don't understand the line <%s> in config file %s" % (line, options.config)
+                continue
+
+            # Allow the user to use either dashes or underscores
+            name = name.replace('-','_')
+
+            if name == 'keyword_file' and not options.keyword_file:
+                options.keyword_file = value
+            if name == 'reader' and not options.reader:
+                options.reader = value
+            if name == 'sound_dir' and not options.sound_dir:
+                options.sound_dir = value
+            if name == 'keywords' and not options.keywords:
+                options.keywords = value
+            if name == 'mecab' and not options.mecab:
+                options.mecab = value
+            if name == 'mecab_config' and not options.mecab_config:
+                options.mecab_config = value
+            if name == 'kakasi' and not options.kakasi:
+                options.kakasi = value
+            if name == 'kakasi_itaijidict' and not options.kakasi_itaijidict:
+                options.kakasi_itaijidict = value
+            if name == 'kakasi_kanwadict' and not options.kakasi_kanwadict:
+                options.kakasi_kanwadict = value
+
+    for name, value in [('mecab', options.mecab), ('mecab_config', options.mecab_config), ('kakasi',options.kakasi)]:
+        if value is None:
+            abort("Please provide location to %s" % name)
+        elif not isfile(value):
+            abort("File given for %s (%s) does not exist" % (name, value))
+
+    return options, texts
+
+
+
+##################################################################################
+# The following classes and support methods are taken
+# largely verbatim from Damien Elmes' Japanese plugin for
+# anki http://ichi2.net/anki/wiki/JapaneseSupport
+
+
+# disable to use kakasi only
+USE_MECAB=True
+# look for mecab&kakasi in the folder anki is being run from
+WIN32_READING_DIR=os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def escapeText(text):
+    # strip characters that trip up kakasi/mecab
+    text = text.replace("\n", " ")
+    text = text.replace(u'\uff5e', "~")
+    text = re.sub("<br( /)?>", "---newline---", text)
+    #text = stripHTML(text)
+    text = text.replace("---newline---", "<br>")
+    return text
+
+if sys.platform == "win32":
+    si = subprocess.STARTUPINFO()
+    try:
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    except:
+        si.dwFlags |= subprocess._subprocess.STARTF_USESHOWWINDOW
+else:
+    si = None
+
+# Mecab
+##########################################################################
+
+class MecabController(object):
+    mecabCmd = ["mecab", '--node-format=%m[%f[7]] ', '--eos-format=\n',
+                '--unk-format=%m[] ']
+    config   = None
+    can_run  = False
+    kakasi   = None
+
+    def __init__(self, config, kakasi):
+        self.config = config
+        self.mecab  = None
+        self.kakasi = kakasi
+        self.setup()
+
+    def setup(self):
+        # Try running the user-specified command
+        if self.config.mecab:
+            if programWorks([self.config.mecab, '--help']):
+                self.mecabCmd[0] = self.config.mecab
+            else:
+                print >>sys.stderr, "I couldn't run the mecab command <%s>" % self.config.mecab
+                return
+        else: # Try just running, maybe it's already in the PATH
+            if not programWorks(['mecab', '--help']):
+                # we don't have mecab
+                print >>sys.stderr, "I couldn't run mecab.  Please install it."
+                print >>sys.stderr, "If it is already installed you may need to"
+                print >>sys.stderr, "add the location to the config file."
+                return
+
+        if self.config.mecab_config:
+            if isfile(self.config.mecab_config):
+                os.environ['MECABRC'] = self.config.mecab_config
+            else:
+                print >>sys.stderr, "I couldn't find the mecab config file <%s>" % self.config.mecabrc
+                return
+        else: # If the user gave a full path to mecab, we need the rc as well
+            if self.mecab_cmd != 'mecab':
+                print >>sys.stderr, "Please add the location of the mecabrc file to your config file"
+                return
+
+        self.can_run = True
+
+    def ensureOpen(self):
+        if not self.mecab:
+            self.setup()
+
+            if not self.can_run:
+                raise Exception(_("Please install mecab"))
+            
+            try:
+                self.mecab = subprocess.Popen(
+                    self.mecabCmd, bufsize=-1, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    startupinfo=si)
+            except OSError:
+                raise Exception(_("Please install mecab"))
+
+    def reading(self, expr):
+        self.ensureOpen()
+        expr = escapeText(expr)
+        self.mecab.stdin.write(expr.encode("euc-jp", "ignore")+'\n')
+        self.mecab.stdin.flush()
+        expr = unicode(self.mecab.stdout.readline().rstrip('\r\n'), "euc-jp")
+        out = []
+        for node in expr.split(" "):
+            if not node:
+                break
+            (kanji, reading) = re.match("(.+)\[(.*)\]", node).groups()
+            # hiragana, punctuation, not japanese, or lacking a reading
+            if kanji == reading or not reading:
+                out.append(kanji)
+                continue
+            # katakana
+            if kanji == self.kakasi.reading(reading):
+                out.append(kanji)
+                continue
+            # convert to hiragana
+            reading = self.kakasi.reading(reading)
+            # ended up the same
+            if reading == kanji:
+                out.append(kanji)
+                continue
+            # don't add readings of numbers
+            if kanji in u"一二三四五六七八九十０１２３４５６７８９":
+                out.append(kanji)
+                continue
+            # strip matching characters and beginning and end of reading and kanji
+            # reading should always be at least as long as the kanji
+            placeL = 0
+            placeR = 0
+            for i in range(1,len(kanji)):
+                if kanji[-i] != reading[-i]:
+                    break
+                placeR = i
+            for i in range(0,len(kanji)-1):
+                if kanji[i] != reading[i]:
+                    break
+                placeL = i+1
+            if placeL == 0:
+                if placeR == 0:
+                    out.append(" %s[%s]" % (kanji, reading))
+                else:
+                    out.append(" %s[%s]%s" % (
+                        kanji[:-placeR], reading[:-placeR], reading[-placeR:]))
+            else:
+                if placeR == 0:
+                    out.append("%s %s[%s]" % (
+                        reading[:placeL], kanji[placeL:], reading[placeL:]))
+                else:
+                    out.append("%s %s[%s]%s" % (
+                        reading[:placeL], kanji[placeL:-placeR],
+                        reading[placeL:-placeR], reading[-placeR:]))
+        fin = u""
+        for c, s in enumerate(out):
+            if c < len(out) - 1 and re.match("^[A-Za-z0-9]+$", out[c+1]):
+                s += " "
+            fin += s
+        return fin.strip()
+
+# Kakasi
+##########################################################################
+
+class KakasiController(object):
+    can_run   = False
+    kakasiCmd = ["kakasi", "-isjis", "-osjis", "-u", "-JH", "-KH"]
+
+    # For the USE_MECAB=False case
+    # kakasiCmd = ["kakasi", "-isjis", "-osjis", "-u", "-JH", "-p"]
+    config = None
+
+    def __init__(self, config):
+        self.config = config
+        self.kakasi = None
+        self.setup()
+
+    def setup(self):
+        # Try running the user-specified command
+        if self.config.kakasi:
+            if programWorks([self.config.kakasi]):
+                self.kakasiCmd[0] = self.config.kakasi
+            else:
+                print >>sys.stderr, "I couldn't run the kakasi command <%s>" % self.config.kakasi
+                return
+        else: # Try just running, maybe it's already in the PATH
+            if not programWorks(['kakasi']):
+                # we don't have kakasi
+                print >>sys.stderr, "I couldn't run kakasi.  Please install it."
+                print >>sys.stderr, "If it is already installed you may need to"
+                print >>sys.stderr, "add the location to the config file."
+                return
+
+        if self.config.kakasi_itaijidict:
+            if isfile(self.config.kakasi_itaijidict):
+                os.environ['ITAIJIDICT'] = self.config.kakasi_itaijidict
+            else:
+                print >>sys.stderr, "I couldn't find the kakasi itaijidict file <%s>" % self.config.kakasi_itaijidict
+                return
+        else:
+            print >>sys.stderr, "Please add the location of the kakasi itaijidict to your config file"
+            return
+
+        if self.config.kakasi_kanwadict:
+            if isfile(self.config.kakasi_kanwadict):
+                os.environ['KANWADICT'] = self.config.kakasi_kanwadict
+            else:
+                print >>sys.stderr, "I couldn't find the kakasi kanwadict file <%s>" % self.config.kakasi_kanwadict
+                return
+        else:
+            print >>sys.stderr, "Please add the location of the kakasi kanwadict to your config file"
+            return
+
+        self.can_run = True
+
+    def ensureOpen(self):
+        if not self.kakasi:
+            self.setup()
+            try:
+                self.kakasi = subprocess.Popen(
+                    self.kakasiCmd, bufsize=-1, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    startupinfo=si)
+            except OSError:
+                raise Exception(_("Please install kakasi"))
+
+    def reading(self, expr):
+        self.ensureOpen()
+        expr = escapeText(expr)
+        self.kakasi.stdin.write(expr.encode("sjis", "ignore")+'\n')
+        self.kakasi.stdin.flush()
+        res = unicode(self.kakasi.stdout.readline().rstrip('\r\n'), "sjis")
+        return res
+
+class Lookup(object):
+    def __init__(self):
+        return
+
+    def edictKanji(self, text):
+        return self.edict(text, True)
+
+    def edict(self, text, kanji=False):
+        "Look up TEXT with edict."
+        if kanji:
+            x="U"
+        else:
+            x="U"
+        server  = "www.csse.monash.edu.au"
+        baseUrl = "/~jwb/cgi-bin/wwwjdic.cgi?1Z"
+        if self.isJapaneseText(text):
+            baseUrl += "U"
+        else:
+            baseUrl += "E"
+        baseUrl += "E"
+        url  = baseUrl + urllib.quote(text.encode("utf-8"))
+        conn = httplib.HTTPConnection(server)
+        conn.request("GET", url)
+        r1 = conn.getresponse()
+        data = "Couldn't connect"
+        if r1.status == 200:
+            data = r1.read()
+
+        clean_data = u' '
+        reading    = False
+        count      = 0
+
+        for d in data.split('\n'):
+            d = unicode(d,'utf-8')
+            if count > 5 or d.startswith('</pre>'):
+                reading = False
+            if reading:
+                clean_data += d
+                clean_data += '\n'
+                count      += 1
+            if d.startswith('<pre>'):
+                reading = True
+        conn.close()
+        return clean_data
+
+    def alc(self, text):
+        """TODO:  Impliment this"""
+        pass
+
+    def isJapaneseText(self, text):
+        "True if 70% of text is a Japanese character."
+        total = len(text)
+        if total == 0:
+            return True
+        jp = 0
+        en = 0
+        for c in text:
+            if ord(c) >= 0x2E00 and ord(c) <= 0x9FFF:
+                jp += 1
+            if re.match("[A-Za-z]", c):
+                en += 1
+        if not jp:
+            return False
+        return ((jp + 1) / float(en + 1)) >= 1.0
+
+
+#####################################################################
+# Classes and utilities for TTS reading
+#####################################################################
+class Reader(object):
+    """Reads a string of text using an available
+       Text-to-speech program"""
+
+    can_run  = False
+    sounddir = None
+    basename = ''
+
+    def __init__(self, config):
+        if config.sound_dir is None:
+            print >>sys.stderr, "Please specify soundir in your config file or command line"
+            print >>sys.stderr, "Audio will not be generated."
+            self.can_run = False
+        else:
+            self.sound_dir = config.sound_dir
+            self.can_run  = True
+
+    def setbasename(self):
+        self.basename = str(int(time.time()))
+
+    def outfile(self, extension):
+        return os.path.join(self.sound_dir, '%s.%s' % (self.basename, extension))
+
+    def read(self, text):
+        raise NotImplementedError("read() of base Reader called")
+
+class KyokoReader(Reader):
+    def __init__(self, config):
+        Reader.__init__(self, config)
+
+    def read(self, text):
+        self.setbasename()
+        _ = subprocess.check_output(['say','-v','kyoko','-o', self.outfile('aiff'), text])
+        _ = subprocess.check_output(['sox', self.outfile('aiff'), self.outfile('mp3')])
+        os.remove(self.outfile('aiff'))
+        return self.basename + '.mp3'
+
+class GoogleReader(Reader):
+    # The incantation for calling Google's TTS comes from
+    # Arthur Helfstein Fragoso's GoogleTTS pluglin   
+    #     http://code.google.com/p/googletts-anki/
+    TTS_ADDRESS = 'http://translate.google.com/translate_tts'
+
+    def __init__(self, config):
+        Reader.__init__(self, config)
+
+    def read(self, text):
+        self.setbasename()
+
+        address = self.TTS_ADDRESS+'?tl=ja&q='+ quote_plus(str(text))
+
+        subprocess.Popen(['mplayer', '-slave', '-user-agent', "'Mozilla/5.0'", address, 
+               '-dumpstream', '-dumpfile', self.outfile('mp3')], 
+              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).wait()
+
+
+def ReaderFactory(config):
+    if config.reader == 'kyoko':
+        if not programWorks(['say', '-v', 'kyoko', '" "']):
+            print >>sys.stderr, "Sorry, I couldn't find the 'say' program or the Kyoko voice,"
+            print >>sys.stderr, "Audio will not be generated."
+            print >>sys.stderr, "Please see http://www.tuaw.com/2011/07/24/os-x-lion-introduces-new-multilingual-high-quality-text-to-spe/"
+            return None
+
+        if not programWorks(['sox', '--help']):
+            print >>sys.stderr, "Sorry, I couldn't find the 'sox' program,"
+            print >>sys.stderr, "Audio will not be generated"
+            print >>sys.stderr, "Please see http://sox.sourceforge.net/"
+            return None
+
+        return KyokoReader(config)
+
+    if config.reader == 'google':
+        if not programWorks(['mplayer']):
+            print >>sys.stderr, "Sorry, I couldn't find the 'mplayer' program"
+            print >>sys.stderr, "Audio will not be generated."
+            print >>sys.stderr, "Please see http://www.mplayerhq.hu/"
+            return None
+
+        return GoogleReader(config)
+
+    if config.reader is not None:
+        print >>sys.stderr, "Sorry, I don't know the %s reader" % config.reader 
+        
+    return None
+
+
+def process_one(expr, mecab, kisaki, reader, lookup, nolookup, outf): 
+    """Process a single chunk of text into MCDs"""
+    sound_string = u''
+
+    if reader:
+        sound_string = u'[sound:%s]' % reader.read(texts[0])
+        
+    reading = mecab.reading(expr)
+
+    reading_pos = 0
+    for i in range(len(expr)):
+        current_char = expr[i]
+
+        if current_char not in nolookup:
+            if current_char in keywords:
+                keyword = keywords[current_char]
+            else:
+                keyword = u'...'
+
+            word_start = 0
+            word_end   = 0
+
+            for word_start in range(reading_pos+1,-1,-1):
+                if reading[word_start] == u'　' or reading[word_start] == u' ':
+                    word_start += 1
+                    break
+            for word_end in range(reading_pos,len(reading)):
+                if reading[word_end] == u'[':
+                    break
+            
+            if reading[word_start:word_end] in definitions:
+                dict = definitions[reading[word_start:word_end]]
+            else:
+                print "Looking up", reading[word_start:word_end]
+                print lookup.edictKanji(reading[word_start:word_end])
+                dict = unicode(raw_input('Definition? '), 'utf-8')
+                if dict.find(':') == -1:
+                    dict = reading[word_start:word_end] + u':' + dict
+                definitions[reading[word_start:word_end]] = dict
+
+            ret = expr[:i] + u'<span style="font-weight:600; color:#0000ff;">[' + keyword + ']</span>' + expr[i+1:] + \
+                  u'\t' + current_char +  \
+                  u'\t' + expr + \
+                  u'\t' + reading + sound_string + \
+                  u'\t' + dict
+            print >>outf, ret.encode("utf-8")
+
+
+        reading_pos += 1
+        if reading_pos < len(reading):
+            if reading[reading_pos] == u'　' or reading[reading_pos] == u' ':
+                reading_pos += 1
+            if reading[reading_pos] == u'[':
+                while reading_pos < len(reading)-1 and reading[reading_pos-1] != u']':
+                    reading_pos += 1
+                if reading[reading_pos] == u'　' or reading[reading_pos] == u' ':
+                    reading_pos += 1
+        else:
+            break
+
+
+if __name__ == '__main__':
+    options, texts = parse_command_line()
+
+    kakasi = KakasiController(options)
+    if not kakasi.can_run:
+        sys.exit(1)
+
+    mecab  = MecabController(options, kakasi)
+    if not mecab.can_run:
+        sys.exit(1)
+
+    reader = ReaderFactory(options)
+    lookup = Lookup()
+
+    keywords = {}
+    if options.keyword_file:
+        for line in open(options.keyword_file):
+            try:
+                keyword, kanji = line.strip().split("\t")
+                keywords[unicode(kanji,'utf-8')] = unicode(keyword, 'utf-8')
+            except:
+                print >>sys.stderr, "Error reading line from keyword file", line
+
+    hiragana = map(unichr, range(0x3040, 0x309F))
+    katakana = map(unichr, range(0x3040+96, 0x309F+96))
+    others   = u"一二三四五六七八九十０１２３４５６７８９ []、！？。「」～?!. - _"
+    nolookup = ''.join(hiragana + katakana) + others
+    definitions = {}
+
+    char_stream = codecs.getreader("utf-8")(sys.stdin)
+
+    texts = [unicode(t, 'utf-8') for t in texts] 
+
+    if options.input_file:
+        instream = codecs.getreader("utf-8")(open(options.input_file))
+        lines    = [l.strip() for l in instream.readlines()]
+        curbatch = ''
+        for l in lines:
+            if l == u'#':
+                texts.append(curbatch)
+                curbatch = ''
+            else:
+                curbatch += l
+
+        if len(curbatch) > 0:
+            texts.append(curbatch)
+
+    if options.output_file:
+        outf = open(options.output_file,'w')
+    else:
+        outf = sys.stdout
+
+    for expr in texts:
+        process_one(expr, mecab, kakasi, reader, lookup, nolookup, outf)
+
+    outf.close()
+    sys.exit(0)
+
