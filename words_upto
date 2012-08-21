@@ -1,0 +1,19 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Edit as appropriate
+core_file  = 'Optimized Kore - Sheet1.tsv'
+keyword    = 'heisig-data.txt'
+words_upto = 200
+
+core6k     = [l.strip().split('\t') for l in open(core_file) if l[0] != '#']
+keywords   = [l.split(':') for l in open(keyword) if l[0] != '#']
+keywords   = [(int(l[0]), l[1]) for l in keywords]
+keywords   = sorted(keywords, cmp=lambda x,y:cmp(x[0],y[0]))
+
+for word in keywords[words_upto:]:
+    core6k = [l for l in core6k if word[1] not in l[6]]
+
+for i in core6k:
+    print '\t'.join(i)
+
